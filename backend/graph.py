@@ -171,10 +171,10 @@ groq_llama3 = ChatGroq(
 )
 
 # Not exposed in the UI
-gpt_4o = ChatOpenAI(model="gpt-4o-2024-08-06", temperature=0.3, streaming=True)
+gpt_4o = ChatOpenAI(model="gpt-4o-2024-08-06", temperature=0.1, streaming=True)
 claude_35_sonnet = ChatAnthropic(
     model="claude-3-5-sonnet-20240620",
-    temperature=0.7,
+    temperature=0.1,
 )
 
 llm = gpt_4o_mini.configurable_alternatives(
@@ -395,9 +395,13 @@ class ResearcherState(TypedDict):
     queries: list[str]
     documents: Annotated[list[Document], update_documents]
 
+class Router(TypedDict):
+    logic: str
+    type: Literal['more-info', 'langchain', 'general']
 
 class AgentState(MessagesState):
-    sub_questions: list[str]
+    router: Router
+    steps: list[str]
     documents: Annotated[list[Document], update_documents]
 
 
@@ -440,40 +444,123 @@ researcher.add_edge("query", END)
 researcher = researcher.compile()
 
 
+
+
+router_prompt = """You are a LangChain Developer advocate. Your job is help people using the LangChain platform answer any issues they are running into.
+
+A user will come to you with an inquiry. Your first job is to classify what type of inquiry it is. The types of inquiries you should classify it as are:
+
+## `more-info`
+Classify a user inquiry as this if you need more information before you will be able to help them. Examples include:
+- The user complains about an error but doesnt provide the error 
+- The user says something isn't working but doesnt explain why/how it's not working
+
+## `langchain`
+Classify a user inquiry as this if it can be answered by looking up information related to the LangChain open source package. The LangChain open source package \
+is a python SDK for working with LLMs. It integrates with various LLMs, databases and APIs.
+
+## `general`
+Classify a user inquiry as this if it is just a general question"""
+
+def route_at_start_node(state: AgentState):
+    messages = [{"role": "system", "content": router_prompt}] + state['messages']
+
+    response = gpt_4o_mini.with_structured_output(Router).invoke(messages)
+    return {"router": response}
+
+def route_at_start(state: AgentState) -> Literal['generate_questions', 'more_info', "general"]:
+    _type = state['router']['type']
+    if _type == "langchain":
+        return "generate_questions"
+    elif _type == "more-info":
+        return "more_info"
+    elif _type == "general":
+        return "general"
+    else:
+        raise ValueError
+
+
+more_info_prompt = """You are a LangChain Developer advocate. Your job is help people using the LangChain platform answer any issues they are running into.
+
+Your boss has determined that more information is needed before doing any research on behalf of the user. This was their logic:
+
+<logic>
+{logic}
+</logic>
+
+Respond to the user and try to get any more relevant information. Do not overwhelm them!! Be nice, and only ask them a single follow up question."""
+
+def more_info(state: AgentState):
+    messages = [{"role": "system", "content": more_info_prompt.format(logic=state['router']['logic'])}] + state['messages']
+
+    response = gpt_4o_mini.invoke(messages)
+    return {"messages": [response]}
+
+
+general_prompt = """You are a LangChain Developer advocate. Your job is help people using the LangChain platform answer any issues they are running into.
+
+Your boss has determined that the user is asking a general question, not one related to the LangGraph platform. This was their logic:
+
+<logic>
+{logic}
+</logic>
+
+Respond to the user. Politely decline to answer and tell them you can only answer questions about LangChain related topics, and that if their question is about LangChain they should clarify how it is.\
+Be nice to them though - they are still a user!"""
+
+
+def general(state: AgentState):
+    messages = [{"role": "system", "content": general_prompt.format(logic=state['router']['logic'])}] + state['messages']
+
+    response = gpt_4o_mini.invoke(messages)
+    return {"messages": [response]}
+
+
 generate_questions_prompt = """You are a LangChain expert, here to assist with any and all questions or issues with LangChain, LangGraph, LangSmith, or any related functionality. Users may come to you with questions or issues.
 
-You are world class researcher. Based on the conversation below, you have the option to generate 3 research questions to research in the LangChain documentation to resolve the users question. These questions should be diverse and cover a spectrum of possibilities. If the question references multiple concepts, or seems like understanding multiple concepts may be needed in order to answer, you should generate a sub question for each of those concepts. Do not answer directly about any LangChain questions without calling the research tool
+You are world class researcher. Based on the conversation below, generate a plan for how you will research the answer to their question. \
+The plan should generally not be more than 3 steps long, it can be as short as one. The length of the plan depends on the question.
 
-Because you will research these questions in the LangChain documentation, if you need any more information from the user ask them for that BEFORE calling this tool. You should respond asking for more information only when:
+You have access to the following documentation sources:
+- Conceptual docs
+- Integration docs
+- How-to guides
 
-- The user complains about an error but doesnt provide the error 
-- The user says something isn't working but doesnt explain why/how it's not working.
+You do not need to specify where you want to research for all steps of the plan, but it's sometimes helpful.
+"""
 
-Otherwise, go ahead and research their question!"""
+
+class Plan(TypedDict):
+    """Ask research questions."""
+    steps: list[str]
+
+class ResearchQuestions(TypedDict):
+    """Ask research questions."""
+    sub_questions: list[str]
+
+
 def generate_questions(state: AgentState):
     messages = [{"role": "system", "content": generate_questions_prompt}] + state['messages']
 
-    class ResearchQuestions(TypedDict):
-        """Ask research questions."""
-        sub_questions: list[str]
 
-    response = gpt_4o_mini.bind_tools([ResearchQuestions]).invoke(messages)
-    if len(response.tool_calls) == 0:
-        return {"messages": response}
-    else:
-        return response.tool_calls[0]['args']
+    response = gpt_4o_mini.with_structured_output(Plan).invoke(messages)
+    return response
 
-def route_question(state: AgentState) -> Literal['generate', 'researcher', END]:
-    if len(state.get("sub_questions", [])) > 0:
-        return [Send("researcher", {"sub_question": q}) for q in state["sub_questions"][:1]]
+def research_node(state: AgentState):
+    result = researcher.invoke({"sub_question": state["steps"][0]})
+    return {
+        "documents": result["documents"],
+        "steps": state["steps"][1:]
+    }
+
+def check_finished(state: AgentState) -> Literal['generate', 'research_node']:
+    if len(state.get("steps", [])) > 0:
+        return "research_node"
     else:
-        if isinstance(state['messages'][-1], HumanMessage):
-            return "generate"
-        else:
-            return END
+        return "generate"
 
 def remove_question(state):
-    return {"sub_questions": state["sub_questions"][1:]}
+    return {"steps": state["steps"][1:]}
 
 
 RESPONSE_TEMPLATE1 = """\
@@ -500,29 +587,39 @@ rather than putting them all at the end. DO NOT PUT THEM ALL THAT END, PUT THEM 
 If there is nothing in the context relevant to the question at hand, do NOT make up an answer. \
 Rather, tell them why you're unsure and ask for any additional information that may help you answer better.
 
+Sometimes, what a user is asking may NOT be possible. Do NOT tell them that things are possible if you don't \
+see evidence for it in the context below. If you don't see based in the information below that something is possible, \
+do NOT say that it is - instead say that you're not sure.
+
 Anything between the following `context`  html blocks is retrieved from a knowledge \
 bank, not part of the conversation with the user. 
 
 <context>
     {context} 
 <context/>
+
 """
 
 
 def generate(state: AgentState):
     context = format_docs(state['documents'])
     prompt = RESPONSE_TEMPLATE1.format(context=context)
-    response = gpt_4o_mini.invoke([{"role": "system", "content": prompt}] + state['messages'])
+    messages = [{"role": "system", "content": prompt}] + state['messages']
+    response = claude_35_sonnet.invoke(messages)
     return {"messages": response}
 
 agent = StateGraph(AgentState, input=MessagesState, output=MessagesState)
-agent.add_node("researcher", researcher)
+agent.add_node(route_at_start_node)
+agent.add_node(more_info)
+agent.add_node(general)
+agent.add_node(research_node)
 agent.add_node(generate_questions)
 agent.add_node(generate)
-agent.add_node(remove_question)
-agent.add_conditional_edges("generate_questions", route_question)
-agent.add_edge("researcher", "remove_question")
-agent.add_conditional_edges("remove_question", route_question)
+agent.add_edge("generate_questions", "research_node")
+agent.add_conditional_edges("research_node", check_finished)
 agent.add_edge("generate", END)
-agent.add_edge(START, "generate_questions")
+agent.add_conditional_edges("route_at_start_node", route_at_start)
+agent.add_edge(START, "route_at_start_node")
+agent.add_edge("general", END)
+agent.add_edge("more_info", END)
 agent = agent.compile()

@@ -1,9 +1,5 @@
 {
-  "python_version": "3.11",
   "dockerfile_lines": [],
-  "dependencies": [
-    "."
-  ],
   "graphs": {
     "chat": "./backend/graph.py:graph",
     "researcher": "./backend/graph.py:researcher",
@@ -12,6 +8,11 @@
   "env": [
     "OPENAI_API_KEY",
     "WEAVIATE_API_KEY",
-    "WEAVIATE_URL"
+    "WEAVIATE_URL",
+    "ANTHROPIC_API_KEY"
+  ],
+  "python_version": "3.11",
+  "dependencies": [
+    "."
   ]
 }
